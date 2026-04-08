@@ -1,6 +1,13 @@
+use crate::derived_metrics::derived_metrics;
+#[cfg(tokio_unstable)]
+use std::ops::Range;
 use std::time::{Duration, Instant};
 use tokio::runtime;
-use crate::derived_metrics::derived_metrics;
+
+#[cfg(tokio_unstable)]
+mod poll_time_histogram;
+#[cfg(tokio_unstable)]
+pub use poll_time_histogram::{HistogramBucket, PollTimeHistogram};
 
 #[cfg(feature = "metrics-rs-integration")]
 pub(crate) mod metrics_rs_integration;
@@ -71,6 +78,7 @@ macro_rules! define_runtime_metrics {
     ) => {
         /// Key runtime metrics.
         #[non_exhaustive]
+        #[cfg_attr(feature = "metrique-integration", metrique::unit_of_work::metrics(subfield_owned))]
         #[derive(Default, Debug, Clone)]
         pub struct RuntimeMetrics {
             $(
@@ -477,6 +485,11 @@ define_runtime_metrics! {
         /// A histogram of task polls since the previous probe grouped by poll
         /// times.
         ///
+        /// Each bucket contains the configured [`Duration`] range and the count
+        /// of task polls that fell into that range during the interval. Use
+        /// [`PollTimeHistogram::as_counts`] to get just the raw counts as a
+        /// `Vec<u64>`.
+        ///
         /// This metric must be explicitly enabled when creating the runtime with
         /// [`enable_metrics_poll_time_histogram`][tokio::runtime::Builder::enable_metrics_poll_time_histogram].
         /// Bucket sizes are fixed and configured at the runtime level. See
@@ -503,10 +516,12 @@ define_runtime_metrics! {
         ///     let mut next_interval = || intervals.next().unwrap();
         ///
         ///     let interval = next_interval();
-        ///     println!("poll count histogram {:?}", interval.poll_time_histogram);
+        ///     for bucket in interval.poll_time_histogram.buckets() {
+        ///         println!("{:?}..{:?} => {} polls", bucket.range_start(), bucket.range_end(), bucket.count());
+        ///     }
         /// });
         /// ```
-        pub poll_time_histogram: Vec<u64>,
+        pub poll_time_histogram: PollTimeHistogram,
 
         /// The number of times worker threads unparked but performed no work before parking again.
         ///
@@ -1257,6 +1272,8 @@ define_semi_stable! {
             num_remote_schedules: u64,
             budget_forced_yield_count: u64,
             io_driver_ready_count: u64,
+            // Cached bucket ranges, static config that doesn't change after runtime creation.
+            bucket_ranges: Vec<Range<Duration>>,
         }
     }
 }
@@ -1289,7 +1306,12 @@ impl RuntimeIntervals {
             metrics.min_polls_count = u64::MAX;
             metrics.min_local_queue_depth = usize::MAX;
             metrics.mean_poll_duration_worker_min = Duration::MAX;
-            metrics.poll_time_histogram = vec![0; self.runtime.poll_time_histogram_num_buckets()];
+            metrics.poll_time_histogram = PollTimeHistogram::new(
+                self.bucket_ranges
+                    .iter()
+                    .map(|range| HistogramBucket::new(range.start, range.end, 0))
+                    .collect(),
+            );
             metrics.budget_forced_yield_count =
                 budget_forced_yields.saturating_sub(self.budget_forced_yield_count);
             metrics.io_driver_ready_count = io_driver_ready_events.saturating_sub(self.io_driver_ready_count);
@@ -1399,6 +1421,10 @@ impl RuntimeMonitor {
             budget_forced_yield_count: self.runtime.budget_forced_yield_count(),
             #[cfg(tokio_unstable)]
             io_driver_ready_count: self.runtime.io_driver_ready_count(),
+            #[cfg(tokio_unstable)]
+            bucket_ranges: (0..self.runtime.poll_time_histogram_num_buckets())
+                .map(|i| self.runtime.poll_time_histogram_bucket_range(i))
+                .collect(),
         }
     }
 }
@@ -1533,12 +1559,12 @@ impl Worker {
 
             // Update the histogram counts if there were polls since last count
             if worker_polls_count > 0 {
-                for (bucket, cell) in metrics.poll_time_histogram.iter_mut().enumerate() {
+                for (bucket, entry) in metrics.poll_time_histogram.buckets_mut().iter_mut().enumerate() {
                     let new = rt.poll_time_histogram_bucket_count(self.worker, bucket);
                     let delta = new.saturating_sub(self.poll_time_histogram[bucket]);
                     self.poll_time_histogram[bucket] = new;
 
-                    *cell = cell.saturating_add(delta);
+                    entry.add_count(delta);
                 }
             }
 
@@ -1584,3 +1610,161 @@ derived_metrics!(
         }
     }
 );
+
+#[cfg(all(test, tokio_unstable, feature = "metrique-integration"))]
+mod metrique_integration_tests {
+    use super::*;
+    use metrique::test_util::test_metric;
+
+    /// Compile-time regression: if a field is added whose type doesn't
+    /// implement `CloseValue`, this will fail to compile.
+    #[test]
+    fn metrique_integration_produces_expected_fields() {
+        let metrics = RuntimeMetrics {
+            workers_count: 4,
+            total_park_count: 100,
+            poll_time_histogram: PollTimeHistogram::new(vec![
+                HistogramBucket::new(Duration::from_micros(0), Duration::from_micros(100), 10),
+                HistogramBucket::new(Duration::from_micros(100), Duration::from_micros(200), 0),
+                HistogramBucket::new(Duration::from_micros(200), Duration::from_micros(500), 3),
+            ]),
+            ..Default::default()
+        };
+
+        let entry = test_metric(metrics);
+
+        // Stable fields
+        assert_eq!(entry.metrics["workers_count"], 4);
+        assert_eq!(entry.metrics["total_park_count"], 100);
+        assert_eq!(entry.metrics["elapsed"].as_f64(), 0.0);
+        assert_eq!(entry.metrics["total_busy_duration"].as_f64(), 0.0);
+        assert_eq!(entry.metrics["global_queue_depth"].as_u64(), 0);
+
+        // Unstable fields
+        assert_eq!(entry.metrics["mean_poll_duration"].as_f64(), 0.0);
+        assert_eq!(entry.metrics["total_steal_count"].as_u64(), 0);
+        assert_eq!(entry.metrics["total_polls_count"].as_u64(), 0);
+
+        // 2 non-zero buckets (count 10 and 3) should produce 2 observations
+        let hist = &entry.metrics["poll_time_histogram"];
+        assert_eq!(hist.distribution.len(), 2, "expected 2 non-zero buckets");
+
+        // midpoint of 0..100µs = 50µs, count = 10
+        match hist.distribution[0] {
+            metrique::writer::Observation::Repeated { total, occurrences } => {
+                assert_eq!(occurrences, 10);
+                assert!((total - 500.0).abs() < 0.01, "expected 50 * 10 = 500, got {total}");
+            }
+            other => panic!("expected Repeated, got {other:?}"),
+        }
+
+        // midpoint of 200..500µs = 350µs, count = 3
+        match hist.distribution[1] {
+            metrique::writer::Observation::Repeated { total, occurrences } => {
+                assert_eq!(occurrences, 3);
+                assert!((total - 1050.0).abs() < 0.01, "expected 350 * 3 = 1050, got {total}");
+            }
+            other => panic!("expected Repeated, got {other:?}"),
+        }
+    }
+
+    /// Collect `RuntimeMetrics` from a live Tokio runtime and verify the pipeline produces valid output.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn metrique_end_to_end() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .enable_metrics_poll_time_histogram()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::runtime::Handle::current();
+            let monitor = RuntimeMonitor::new(&handle);
+            let mut intervals = monitor.intervals();
+
+            let _ = intervals.next().unwrap();
+
+            // Spawn tasks to create some work for the runtime to poll.
+            let mut metrics_with_polls = None;
+            for _ in 0..4 {
+                for _ in 0..25 {
+                    tokio::spawn(async {
+                        tokio::task::yield_now().await;
+                    })
+                    .await
+                    .unwrap();
+                }
+                // Slow poll (>900µs) to land in the last histogram bucket.
+                tokio::spawn(async {
+                    std::thread::sleep(Duration::from_millis(1));
+                })
+                .await
+                .unwrap();
+
+                let metrics = intervals.next().unwrap();
+                let total_polls: u64 = metrics.poll_time_histogram.buckets().iter().map(|b| b.count()).sum();
+                if total_polls > 0 {
+                    metrics_with_polls = Some(metrics);
+                    break;
+                }
+            }
+            let metrics = metrics_with_polls.expect("expected polls to be recorded within 4 sampled intervals");
+
+            let expected_workers_count = metrics.workers_count;
+            let expected_non_zero_buckets = metrics
+                .poll_time_histogram
+                .buckets()
+                .iter()
+                .filter(|b| b.count() > 0)
+                .count();
+
+            let expected_total_polls: u64 = metrics.poll_time_histogram.buckets().iter().map(|b| b.count()).sum();
+            assert!(expected_workers_count > 0);
+            assert!(expected_total_polls > 0);
+
+            let last_bucket = metrics.poll_time_histogram.buckets().last().unwrap();
+
+            // Sanity check: Tokio's last histogram bucket ends at Duration::from_nanos(u64::MAX)
+            assert_eq!(last_bucket.range_end(), Duration::from_nanos(u64::MAX));
+            assert!(last_bucket.count() > 0, "expected slow poll to land in last bucket");
+            let last_bucket_start_us = last_bucket.range_start().as_micros() as f64;
+            let last_bucket_count = last_bucket.count();
+
+            let entry = test_metric(metrics);
+
+            assert_eq!(entry.metrics["workers_count"], expected_workers_count as u64);
+            assert!(entry.metrics["elapsed"].as_f64() >= 0.0);
+            assert!(entry.metrics["total_busy_duration"].as_f64() >= 0.0);
+
+            let hist = &entry.metrics["poll_time_histogram"];
+            assert_eq!(hist.distribution.len(), expected_non_zero_buckets);
+            let observed_total_occurrences: u64 = hist
+                .distribution
+                .iter()
+                .map(|obs| match obs {
+                    metrique::writer::Observation::Repeated { occurrences, .. } => *occurrences,
+                    other => panic!("expected Repeated, got {other:?}"),
+                })
+                .sum();
+            assert_eq!(observed_total_occurrences, expected_total_polls);
+
+            // The last observation corresponds to the last histogram bucket.
+            // Verify it uses range_start as the representative value instead of a midpoint,
+            // since the last bucket range_end is Duration::from_nanos(u64::MAX).
+            let last_obs = hist.distribution.last().unwrap();
+            match last_obs {
+                metrique::writer::Observation::Repeated { total, occurrences } => {
+                    assert_eq!(*occurrences, last_bucket_count);
+                    let expected_total = last_bucket_start_us * last_bucket_count as f64;
+                    assert!(
+                        (total - expected_total).abs() < 0.01,
+                        "last bucket should use range_start ({last_bucket_start_us}µs) as representative value, \
+                         expected total={expected_total}, got {total}"
+                    );
+                }
+                other => panic!("expected Repeated, got {other:?}"),
+            }
+        });
+    }
+}
